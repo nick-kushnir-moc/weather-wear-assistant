@@ -1,0 +1,423 @@
+from fastapi import APIRouter, HTTPException, Depends, File, UploadFile
+from typing import Dict, List, Any, Optional
+import logging
+import time
+import json
+import re
+import sys
+import os
+from dotenv import load_dotenv
+import psycopg2
+import psycopg2.extras
+from datetime import datetime
+from openai import OpenAI
+from langchain_community.llms import OpenAI as LangchainOpenAI
+from langchain.chains import LLMChain
+from langchain.prompts import PromptTemplate
+
+# Fixed imports to get the actual classes instead of the module
+from models.nl_query import NLQueryRequest, QueryResponse
+from db import get_db
+from configs import config
+
+load_dotenv()
+
+# Set up logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+stream_handler = logging.StreamHandler(sys.stdout)
+log_formatter = logging.Formatter("%(asctime)s [%(processName)s: %(process)d] [%(threadName)s: %(thread)d] [%(levelname)s] %(name)s: %(message)s")
+stream_handler.setFormatter(log_formatter)
+logger.addHandler(stream_handler)
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Initialize OpenAI client
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+# Initialize LangChain OpenAI client
+langchain_openai = LangchainOpenAI(openai_api_key=OPENAI_API_KEY)
+
+# Database connection details
+POSTGRES_HOST = "localhost"
+POSTGRES_DBNAME = "postgres"
+POSTGRES_USER = "postgres"
+POSTGRES_PASSWORD = "mocAi"
+POSTGRES_PORT = 5432
+
+# Define the database schema for the LLM - using your provided schema
+DB_SCHEMA = """
+Available tables and their schemas:
+
+1. employees
+   - id (SERIAL): Primary key
+   - name (VARCHAR): Employee name
+   - salary (INTEGER): Employee salary
+   - dept_id (INTEGER): Foreign key referencing departments.id
+   - hiring_personal_id (INTEGER): Foreign key referencing hiring_personal.id
+
+2. hiring_personal
+   - id (SERIAL): Primary key
+   - name (VARCHAR): Person's name
+   - age (INTEGER): Person's age
+   - gender (CHAR): Person's gender ('m' or 'f')
+
+3. departments
+   - id (SERIAL): Primary key
+   - name (VARCHAR): Department name (unique)
+
+4. reservations
+   - id (SERIAL): Primary key
+   - employee_id (INTEGER): Foreign key referencing employees.id
+   - start_date (DATE): Reservation start date
+   - end_date (DATE): Reservation end date
+   - reservation_type (INTEGER): Type of reservation (1: vacation, 2: sick leave, 3: work)
+   - shift_start (TIME): Shift start time (for work reservations)
+   - shift_end (TIME): Shift end time (for work reservations)
+   - work_date (DATE): Work date (for work reservations)
+
+5. appointments
+   - appointment_id (SERIAL): Primary key
+   - employee_id (INTEGER): Foreign key referencing employees.id
+   - title (VARCHAR): Appointment title
+   - description (TEXT): Appointment description
+   - start_time (TIMESTAMP): Appointment start time
+   - end_time (TIMESTAMP): Appointment end time
+   - status (VARCHAR): Appointment status (e.g., pending, confirmed, cancelled)
+
+6. schedules
+   - schedule_id (SERIAL): Primary key
+   - employee_id (INTEGER): Foreign key referencing employees.id
+   - appointment_id (INTEGER): Foreign key referencing appointments.appointment_id
+   - date (DATE): Schedule date
+   - start_time (TIME): Schedule start time
+   - end_time (TIME): Schedule end time
+
+Relationships:
+- employees.dept_id references departments.id
+- employees.hiring_personal_id references hiring_personal.id
+- reservations.employee_id references employees.id
+- appointments.employee_id references employees.id
+- schedules.employee_id references employees.id
+- schedules.appointment_id references appointments.appointment_id
+"""
+
+router = APIRouter(
+    prefix="/api/nl-query",
+    tags=["natural-language-query"],
+)
+
+def connect_to_postgres():
+    """Establish a connection to PostgreSQL database"""
+    try:
+        conn = psycopg2.connect(
+            host=POSTGRES_HOST,
+            dbname=POSTGRES_DBNAME,
+            user=POSTGRES_USER,
+            password=POSTGRES_PASSWORD,
+            port=POSTGRES_PORT
+        )
+        return conn
+    except psycopg2.Error as e:
+        raise HTTPException(status_code=500, detail=f"Error while connecting to PostgreSQL: {e}")
+
+def execute_query(query: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """
+    Execute a SQL query and return results as a list of dictionaries
+    """
+    conn = None
+    cur = None
+    try:
+        conn = connect_to_postgres()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        cur.execute(query, params)
+        results = cur.fetchall()
+        
+        return [dict(row) for row in results]
+    
+    except Exception as e:
+        logger.error(f"Database query error: {str(e)}")
+        raise
+    
+    finally:
+        if cur is not None:
+            cur.close()
+        if conn is not None:
+            conn.close()
+
+def execute_safe_sql(query: str) -> List[Dict[str, Any]]:
+    """
+    Execute a SQL query string that was generated by an LLM
+    This performs basic validation to reduce SQL injection risks
+    """
+    # Simple validation - restrict to SELECT queries only
+    query = query.strip()
+    if not query.lower().startswith("select "):
+        raise ValueError("Only SELECT queries are allowed for safety reasons")
+    
+    # Block multiple statements
+    if ";" in query[:-1]:  # Allow semicolon at the end
+        raise ValueError("Multiple SQL statements are not allowed")
+    
+    # Block dangerous SQL commands
+    dangerous_keywords = ["drop", "delete", "update", "insert", "alter", "create", "truncate"]
+    for keyword in dangerous_keywords:
+        if f" {keyword} " in f" {query.lower()} ":
+            raise ValueError(f"Dangerous SQL keyword '{keyword}' is not allowed")
+    
+    # Execute the sanitized query
+    return execute_query(query)
+
+def process_natural_language_query(query: str) -> str:
+    """
+    Process a natural language query using LangChain to generate a SQL query
+    """
+    try:
+        # Create a prompt template for SQL generation
+        sql_prompt_template = PromptTemplate(
+            input_variables=["schema", "query"],
+            template="""
+            You are a database expert that converts natural language to SQL. 
+            
+            {schema}
+            
+            Generate a PostgreSQL query for the following request: "{query}"
+            
+            The query should:
+            1. Be a valid PostgreSQL query
+            2. Use appropriate table joins based on the schema
+            3. Include only necessary columns in the result
+            4. Use meaningful column aliases for clarity
+            5. Ensure all table names are enclosed in double quotes
+            
+            Return only the SQL query, enclosed in triple backticks like ```sql\nYOUR QUERY\n```
+            """
+        )
+        
+        # Create LLM chain
+        sql_chain = LLMChain(llm=langchain_openai, prompt=sql_prompt_template)
+        
+        # Generate SQL query
+        response = sql_chain.run({"schema": DB_SCHEMA, "query": query})
+        
+        # Extract SQL query from response
+        sql_query = clean_sql_query(response)
+        
+        logger.info(f"Generated SQL query: {sql_query}")
+        return sql_query
+    
+    except Exception as e:
+        logger.error(f"Error processing natural language query: {str(e)}", exc_info=True)
+        raise Exception(f"Failed to process query: {str(e)}")
+
+def clean_sql_query(sql_response: str) -> str:
+    """
+    Clean up the SQL query returned from the LLM
+    """
+    # Extract SQL query from code block if present
+    sql_query_match = re.search(r"```sql\n(.*?)```", sql_response, re.DOTALL)
+    if sql_query_match:
+        sql_query = sql_query_match.group(1).strip()
+    else:
+        # Try another pattern
+        sql_query_match = re.search(r"```(.*?)```", sql_response, re.DOTALL)
+        if sql_query_match:
+            sql_query = sql_query_match.group(1).strip()
+        else:
+            # Assume the whole response is the SQL query
+            sql_query = sql_response.strip()
+    
+    # Ensure table names use double quotes for PostgreSQL
+    sql_query = re.sub(r'(?i)FROM\s+([a-z_][a-z0-9_]*)', r'FROM "\1"', sql_query)
+    sql_query = re.sub(r'(?i)JOIN\s+([a-z_][a-z0-9_]*)', r'JOIN "\1"', sql_query)
+    
+    # Add semicolon if missing
+    if not sql_query.strip().endswith(";"):
+        sql_query = sql_query.strip() + ";"
+    
+    return sql_query
+
+def generate_user_friendly_message(query: str, results: List[Dict[str, Any]]) -> str:
+    """
+    Generate a user-friendly message based on query results
+    """
+    try:
+        # Create a prompt template for user-friendly message
+        message_prompt_template = PromptTemplate(
+            input_variables=["query", "results"],
+            template="""
+            Based on the query: "{query}" 
+            
+            And the following results: {results}
+            
+            Create a concise, user-friendly summary of the results. Format the response in a way that's easy to read.
+            """
+        )
+        
+        # Create LLM chain
+        message_chain = LLMChain(llm=langchain_openai, prompt=message_prompt_template)
+        
+        # Generate user-friendly message
+        response = message_chain.run({
+            "query": query,
+            "results": json.dumps(results, default=str)
+        })
+        
+        return response.strip()
+    
+    except Exception as e:
+        logger.error(f"Error generating user-friendly message: {str(e)}", exc_info=True)
+        return f"Here are the results: {results}"
+
+@router.post("/process", response_model=QueryResponse)
+async def process_query(request: NLQueryRequest, db=Depends(get_db)):
+    """
+    Process a natural language query and return database results
+    """
+    start_time = time.time()
+    
+    try:
+        logger.info(f"Processing natural language query: {request.query}")
+        
+        # Process the natural language query using LLM
+        sql_query = process_natural_language_query(request.query)
+        logger.info(f"Generated SQL query: {sql_query}")
+        
+        # Execute the query against the database
+        results = execute_safe_sql(sql_query)
+        
+        # Generate user-friendly message
+        friendly_message = generate_user_friendly_message(request.query, results)
+        
+        # Calculate query execution time
+        execution_time = time.time() - start_time
+        
+        return QueryResponse(
+            original_query=request.query,
+            sql_query=sql_query,
+            results=results,
+            user_message=friendly_message,
+            metadata={
+                "execution_time_seconds": round(execution_time, 3),
+                "row_count": len(results)
+            }
+        )
+    except ValueError as e:
+        # Handle validation errors (from execute_safe_sql)
+        logger.warning(f"SQL query validation error: {str(e)}")
+        return QueryResponse(
+            original_query=request.query,
+            sql_query="",  # Empty as the query was rejected
+            results=[],
+            error=f"Query validation failed: {str(e)}"
+        )
+    except Exception as e:
+        # Log the error
+        logger.error(f"Error processing query: {str(e)}", exc_info=True)
+        
+        # Return structured error response
+        return QueryResponse(
+            original_query=request.query,
+            sql_query="",
+            results=[],
+            error=f"Failed to process query: {str(e)}"
+        )
+
+@router.get("/schema", response_model=Dict[str, Any])
+async def get_database_schema():
+    """
+    Get the database schema for reference
+    """
+    try:
+        # Query to get table information using PostgreSQL's information_schema
+        tables_query = """
+        SELECT 
+            table_name,
+            column_name,
+            data_type,
+            is_nullable
+        FROM 
+            information_schema.columns
+        WHERE 
+            table_schema = 'public'
+        ORDER BY 
+            table_name, ordinal_position;
+        """
+        
+        # Execute the query
+        columns = execute_safe_sql(tables_query)
+        
+        # Organize the results by table
+        schema = {}
+        for column in columns:
+            table_name = column["table_name"]
+            if table_name not in schema:
+                schema[table_name] = []
+            
+            schema[table_name].append({
+                "column_name": column["column_name"],
+                "data_type": column["data_type"],
+                "is_nullable": column["is_nullable"]
+            })
+        
+        return {"tables": schema}
+    
+    except Exception as e:
+        logger.error(f"Error fetching database schema: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to fetch database schema: {str(e)}")
+
+@router.post("/transcribe-and-query", response_model=QueryResponse)
+async def transcribe_and_query(file: UploadFile = File(...), db=Depends(get_db)):
+    """
+    Transcribe audio file and process as a natural language query
+    """
+    try:
+        # Check if Whisper model is installed
+        import whisper
+        
+        # Save uploaded file temporarily
+        audio_file_path = f"temp_{int(time.time())}.wav"
+        with open(audio_file_path, "wb") as f:
+            f.write(await file.read())
+        
+        # Load audio and transcribe
+        model = whisper.load_model("base")
+        audio = whisper.load_audio(audio_file_path)
+        audio = whisper.pad_or_trim(audio)
+        mel = whisper.log_mel_spectrogram(audio).to(model.device)
+        
+        # Detect language and transcribe
+        _, probs = model.detect_language(mel)
+        detected_language = max(probs, key=probs.get)
+        options = whisper.DecodingOptions()
+        result = whisper.decode(model, mel, options)
+        
+        # Clean up temp file
+        os.remove(audio_file_path)
+        
+        # Process the transcribed text as a natural language query
+        transcribed_text = result.text
+        logger.info(f"Transcribed text: {transcribed_text}")
+        
+        # Process as a natural language query
+        sql_query = process_natural_language_query(transcribed_text)
+        results = execute_safe_sql(sql_query)
+        friendly_message = generate_user_friendly_message(transcribed_text, results)
+        
+        return QueryResponse(
+            original_query=transcribed_text,
+            sql_query=sql_query,
+            results=results,
+            user_message=friendly_message,
+            metadata={
+                "language": detected_language,
+                "row_count": len(results)
+            }
+        )
+        
+    except ImportError:
+        raise HTTPException(status_code=400, detail="Whisper model not installed. Please install it with 'pip install whisper'.")
+    except Exception as e:
+        logger.error(f"Error transcribing and processing query: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error processing audio: {str(e)}")

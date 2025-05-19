@@ -1,0 +1,9 @@
+psycopg2-binary
+fastapi
+uvicorn
+sqlalchemy === 1.4.42
+alembic
+openai
+langchain
+langchain_community
+openai-whisper
