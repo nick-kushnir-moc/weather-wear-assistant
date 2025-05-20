@@ -1,0 +1,64 @@
+[pytest]
+# Test discovery paths
+testpaths = tests
+
+# Test file patterns
+python_files = test_*.py
+python_classes = Test*
+python_functions = test_*
+
+# Register custom markers to categorize tests
+markers =
+    unit: marks tests as unit tests
+    integration: marks tests as integration tests
+    llm: marks tests that involve LLM interactions
+    contract: marks tests that make real API calls to verify contracts
+    e2e: marks end-to-end tests
+    slow: marks tests that take a long time to run
+
+# Default command line options
+addopts = 
+    --verbose
+    --cov=.
+    --cov-report=term
+    --cov-report=html
+    -p no:warnings
+
+# Fail if coverage is below threshold (optional, uncomment to enable)
+# --cov-fail-under=80
+
+# Coverage configuration
+[coverage:run]
+# Source directories to measure
+source = 
+    routers
+    models
+    
+# Files/directories to exclude from coverage
+omit =
+    */tests/*
+    */__pycache__/*
+    */venv/*
+    */migrations/*
+    */alembic/*
+    */configs.py
+    */db.py
+    */main.py
+
+[coverage:report]
+# Exclude lines from coverage
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    raise NotImplementedError
+    if __name__ == .__main__.:
+    pass
+    raise ImportError
+
+# Environment variables needed for tests
+[tool:pytest]
+env =
+    TESTING=True
+    DATABASE_URL=postgresql://postgres:mocAi@localhost:5432/test_db
+    OPENAI_API_KEY=test_openai_key
+    WEATHER_API_KEY=test_weather_key

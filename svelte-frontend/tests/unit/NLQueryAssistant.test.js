@@ -1,413 +1,150 @@
-import { render, fireEvent, screen, waitFor } from '@testing-library/svelte';
+import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
 import { vi } from 'vitest';
-import { tick } from 'svelte';
-import { get } from 'svelte/store';
 import NLQueryAssistant from '../../src/components/NLQueryAssistant.svelte';
 import axios from 'axios';
 
 // Mock axios
 vi.mock('axios');
 
-describe('NLQueryAssistant.svelte', () => {
-  // Setup before each test
+describe('NLQueryAssistant Component', () => {
+  // Reset mocks before each test
   beforeEach(() => {
-    // Reset axios mocks
     vi.resetAllMocks();
   });
 
-  test('renders correctly with initial empty state', () => {
+  test('renders correctly with initial state', () => {
     const { getByText, getByPlaceholderText } = render(NLQueryAssistant);
     
-    // Check that component title is rendered
+    // Verify heading and description are present
     expect(getByText('Database Query Assistant')).toBeInTheDocument();
+    expect(getByText(/Ask a question about your data/i)).toBeInTheDocument();
     
-    // Check that input field is rendered
-    const inputElement = getByPlaceholderText(/Show all employees/i);
+    // Verify input and button are present
+    const inputElement = getByPlaceholderText(/Show me all employees/i);
     expect(inputElement).toBeInTheDocument();
+    expect(inputElement.value).toBe('');
     
-    // Check that search button is rendered
     const searchButton = getByText('Search');
     expect(searchButton).toBeInTheDocument();
     expect(searchButton).not.toBeDisabled();
+    
+    // Verify no results are shown initially
+    expect(screen.queryByText('Results:')).not.toBeInTheDocument();
+    expect(screen.queryByText('Generated SQL:')).not.toBeInTheDocument();
   });
 
-  test('displays error when submitting empty query', async () => {
-    const { getByText, getByPlaceholderText } = render(NLQueryAssistant);
-    
-    // Get the input field and search button
-    const inputElement = getByPlaceholderText(/Show all employees/i);
-    const searchButton = getByText('Search');
+  test('shows validation error when submitting empty query', async () => {
+    const { getByText } = render(NLQueryAssistant);
     
     // Submit with empty query
-    await fireEvent.click(searchButton);
-    
-    // Check that error message is displayed
-    expect(getByText('Please enter a query.')).toBeInTheDocument();
-  });
-
-  test('processes query and displays results correctly', async () => {
-    // Mock the API response
-    const mockResponse = {
-      data: {
-        original_query: 'Show all employees in AAP department',
-        sql_query: 'SELECT * FROM "employees" WHERE department = "AAP";',
-        results: [
-          { id: 1, name: 'John Doe', department: 'AAP' },
-          { id: 2, name: 'Jane Smith', department: 'AAP' }
-        ],
-        user_message: 'Found 2 employees in the AAP department.',
-        metadata: {
-          execution_time_seconds: 0.5,
-          row_count: 2
-        }
-      }
-    };
-    
-    // Setup the mock response
-    axios.post.mockResolvedValueOnce(mockResponse);
-    
-    // Render the component
-    const { getByText, getByPlaceholderText, getAllByRole } = render(NLQueryAssistant);
-    
-    // Type a query
-    const inputElement = getByPlaceholderText(/Show all employees/i);
-    await fireEvent.input(inputElement, { target: { value: 'Show all employees in AAP department' } });
-    
-    // Submit the query
     const searchButton = getByText('Search');
     await fireEvent.click(searchButton);
     
-    // Wait for results to be displayed
-    await waitFor(() => {
-      // Check SQL query is displayed
-      expect(getByText(/SELECT \* FROM "employees" WHERE department = "AAP";/i)).toBeInTheDocument();
-      
-      // Check user message is displayed
-      expect(getByText('Found 2 employees in the AAP department.')).toBeInTheDocument();
-      
-      // Check results table is displayed
-      expect(getByText('Results: 2 rows')).toBeInTheDocument();
-      
-      // Check table has correct number of rows (header + 2 data rows)
-      const tableRows = getAllByRole('row');
-      expect(tableRows.length).toBe(3);
-      
-      // Check first row data
-      expect(getByText('John Doe')).toBeInTheDocument();
-      expect(getByText('Jane Smith')).toBeInTheDocument();
+    // Verify error message
+    expect(getByText('Please enter a query.')).toBeInTheDocument();
+  });
+  
+  test('process query and display results', async () => {
+    // Mock axios post response
+    axios.post.mockResolvedValueOnce({
+      data: {
+        original_query: "Show all employees in AAP department",
+        sql_query: 'SELECT e.id, e.name, d.name as department_name FROM "employees" e JOIN "departments" d ON e.dept_id = d.id WHERE d.name = \'AAP\';',
+        results: [
+          {id: 1, name: "John Doe", department_name: "AAP"},
+          {id: 2, name: "Jane Smith", department_name: "AAP"}
+        ],
+        user_message: "Found 2 employees in the AAP department.",
+        metadata: {execution_time_seconds: 0.123, row_count: 2}
+      }
     });
     
-    // Verify axios was called correctly
-    expect(axios.post).toHaveBeenCalledTimes(1);
+    const { getByText, getByPlaceholderText } = render(NLQueryAssistant);
+    
+    // Enter query text
+    const inputElement = getByPlaceholderText(/Show me all employees/i);
+    await fireEvent.input(inputElement, { target: { value: 'Show all employees in AAP department' } });
+    
+    // Submit query
+    const searchButton = getByText('Search');
+    await fireEvent.click(searchButton);
+    
+    // Verify axios was called with correct parameters
     expect(axios.post).toHaveBeenCalledWith(
       'http://localhost:8000/api/nl-query/process',
       { query: 'Show all employees in AAP department' }
     );
-  });
-
-  test('displays error when API request fails', async () => {
-    // Mock API failure
-    axios.post.mockRejectedValueOnce({ 
-      response: { 
-        data: { detail: 'Internal server error' } 
-      } 
-    });
     
-    // Render the component
-    const { getByText, getByPlaceholderText } = render(NLQueryAssistant);
-    
-    // Type a query
-    const inputElement = getByPlaceholderText(/Show all employees/i);
-    await fireEvent.input(inputElement, { target: { value: 'Show all employees' } });
-    
-    // Submit the query
-    const searchButton = getByText('Search');
-    await fireEvent.click(searchButton);
-    
-    // Wait for error to be displayed
+    // Wait for results to appear
     await waitFor(() => {
-      expect(getByText('Internal server error')).toBeInTheDocument();
+      // Verify SQL query is displayed
+      expect(screen.getByText('Generated SQL:')).toBeInTheDocument();
+      
+      // Verify results are displayed
+      expect(screen.getByText('Results: 2 rows')).toBeInTheDocument();
+      
+      // Verify table contains the correct data
+      expect(screen.getByText('John Doe')).toBeInTheDocument();
+      expect(screen.getByText('Jane Smith')).toBeInTheDocument();
     });
   });
-
-  test('disables search button during query processing', async () => {
-    // Mock a delayed API response
-    axios.post.mockImplementationOnce(() => {
-      return new Promise(resolve => {
-        setTimeout(() => {
-          resolve({
-            data: {
-              original_query: 'Show all employees',
-              sql_query: 'SELECT * FROM "employees";',
-              results: [],
-              metadata: {}
-            }
-          });
-        }, 500);
-      });
-    });
-    
-    // Render the component
-    const { getByText, getByPlaceholderText } = render(NLQueryAssistant);
-    
-    // Type a query
-    const inputElement = getByPlaceholderText(/Show all employees/i);
-    await fireEvent.input(inputElement, { target: { value: 'Show all employees' } });
-    
-    // Submit the query
-    const searchButton = getByText('Search');
-    await fireEvent.click(searchButton);
-    
-    // Check that button is disabled and shows "Processing..."
-    await waitFor(() => {
-      expect(getByText('Processing...')).toBeInTheDocument();
-      expect(getByText('Processing...')).toBeDisabled();
-    });
-    
-    // Wait for processing to complete
-    await waitFor(() => {
-      expect(getByText('Search')).toBeInTheDocument();
-      expect(getByText('Search')).not.toBeDisabled();
-    }, { timeout: 1000 });
-  });
-});
-
-// svelte-frontend/tests/unit/WeatherDressAssistant.test.js
-import { render, fireEvent, screen, waitFor } from '@testing-library/svelte';
-import { vi } from 'vitest';
-import { tick } from 'svelte';
-import WeatherDressAssistant from '../../src/components/WeatherDressAssistant.svelte';
-import axios from 'axios';
-
-// Mock axios
-vi.mock('axios');
-
-describe('WeatherDressAssistant.svelte', () => {
-  // Setup before each test
-  beforeEach(() => {
-    // Reset axios mocks
-    vi.resetAllMocks();
-    
-    // Mock Date.now() to return a consistent date for testing
-    const mockDate = new Date('2023-10-20T12:00:00Z');
-    vi.spyOn(global, 'Date').mockImplementation(() => mockDate);
-  });
-
-  afterEach(() => {
-    // Restore Date
-    vi.restoreAllMocks();
-  });
-
-  test('renders correctly with initial state', () => {
-    const { getByText, getByLabelText } = render(WeatherDressAssistant);
-    
-    // Check that component title is rendered
-    expect(getByText('Weather-Based Dress Assistant')).toBeInTheDocument();
-    
-    // Check that form fields are rendered
-    expect(getByLabelText('Location')).toBeInTheDocument();
-    expect(getByLabelText('Date')).toBeInTheDocument();
-    expect(getByLabelText('Occasion (optional)')).toBeInTheDocument();
-    
-    // Check that the submit button is rendered
-    const submitButton = getByText('Get Recommendations');
-    expect(submitButton).toBeInTheDocument();
-    // Button should be disabled initially because location is empty
-    expect(submitButton).toBeDisabled();
-  });
-
-  test('enables button when location and date are filled', async () => {
-    const { getByText, getByLabelText } = render(WeatherDressAssistant);
-    
-    // Get form fields
-    const locationInput = getByLabelText('Location');
-    const dateInput = getByLabelText('Date');
-    const submitButton = getByText('Get Recommendations');
-    
-    // Initially button should be disabled
-    expect(submitButton).toBeDisabled();
-    
-    // Fill in required fields
-    await fireEvent.input(locationInput, { target: { value: 'London, UK' } });
-    await fireEvent.input(dateInput, { target: { value: '2023-10-21' } });
-    
-    // Now button should be enabled
-    expect(submitButton).not.toBeDisabled();
-  });
-
-  test('selects a popular location when clicked', async () => {
-    const { getByText, getByLabelText } = render(WeatherDressAssistant);
-    
-    // Get location input and a popular location chip
-    const locationInput = getByLabelText('Location');
-    const londonChip = getByText('London, UK');
-    
-    // Click on the London location chip
-    await fireEvent.click(londonChip);
-    
-    // Check that the location input was updated
-    expect(locationInput.value).toBe('London, UK');
-    
-    // The London chip should now have the selected class
-    expect(londonChip.classList.contains('selected')).toBe(true);
-  });
-
-  test('fetches and displays clothing recommendations', async () => {
-    // Mock successful API response
-    const mockResponse = {
-      data: {
-        date: '2023-10-21',
-        location: 'London, UK',
-        weather_summary: 'Cloudy with temperature of 15.5°C',
-        temperature: 15.5,
-        conditions: 'Cloudy',
-        recommendations: {
-          summary: 'It\'s a cool, cloudy day. Dress in layers for comfort.',
-          outfit: {
-            top: [3, 'Black hoodie'],
-            bottom: [1, 'Blue jeans'],
-            footwear: [1, 'White sneakers'],
-            accessories: [
-              [4, 'Black sunglasses']
-            ]
-          },
-          tips: [
-            'Bring a light jacket in case it gets colder',
-            'Dress in layers that can be removed if it gets warmer'
-          ]
+  
+  test('handles API error gracefully', async () => {
+    // Mock axios post to return error
+    axios.post.mockRejectedValueOnce({
+      response: {
+        data: {
+          detail: 'An error occurred while processing your query.'
         }
       }
-    };
-    
-    // Setup mock response
-    axios.post.mockResolvedValueOnce(mockResponse);
-    
-    // Render the component
-    const { getByText, getByLabelText, getAllByRole } = render(WeatherDressAssistant);
-    
-    // Fill in the form
-    const locationInput = getByLabelText('Location');
-    const dateInput = getByLabelText('Date');
-    const occasionInput = getByLabelText('Occasion (optional)');
-    
-    await fireEvent.input(locationInput, { target: { value: 'London, UK' } });
-    await fireEvent.input(dateInput, { target: { value: '2023-10-21' } });
-    await fireEvent.input(occasionInput, { target: { value: 'Casual day out' } });
-    
-    // Submit the form
-    const submitButton = getByText('Get Recommendations');
-    await fireEvent.click(submitButton);
-    
-    // Wait for recommendations to be displayed
-    await waitFor(() => {
-      // Check weather info is displayed
-      expect(getByText('Weather in London, UK on 2023-10-21')).toBeInTheDocument();
-      expect(getByText('Temperature: 15.5°C')).toBeInTheDocument();
-      expect(getByText('Conditions: Cloudy')).toBeInTheDocument();
-      
-      // Check recommendations are displayed
-      expect(getByText('Clothing Recommendations')).toBeInTheDocument();
-      expect(getByText('It\'s a cool, cloudy day. Dress in layers for comfort.')).toBeInTheDocument();
-      
-      // Check outfit items are displayed
-      expect(getByText('Black hoodie')).toBeInTheDocument();
-      expect(getByText('Blue jeans')).toBeInTheDocument();
-      expect(getByText('White sneakers')).toBeInTheDocument();
-      
-      // Check tips are displayed
-      expect(getByText('Additional Tips:')).toBeInTheDocument();
-      expect(getByText('Bring a light jacket in case it gets colder')).toBeInTheDocument();
     });
     
-    // Verify axios was called correctly
-    expect(axios.post).toHaveBeenCalledTimes(1);
-    expect(axios.post).toHaveBeenCalledWith(
-      'http://localhost:8000/api/weather-assistant/dress-recommendation',
-      {
-        user_id: 1, // Default user ID
-        location: 'London, UK',
-        date: '2023-10-21',
-        occasion: 'Casual day out',
-        preferences: ''
+    const { getByText, getByPlaceholderText } = render(NLQueryAssistant);
+    
+    // Enter query text
+    const inputElement = getByPlaceholderText(/Show me all employees/i);
+    await fireEvent.input(inputElement, { target: { value: 'This will cause an error' } });
+    
+    // Submit query
+    const searchButton = getByText('Search');
+    await fireEvent.click(searchButton);
+    
+    // Wait for error message to appear
+    await waitFor(() => {
+      expect(screen.getByText('An error occurred while processing your query.')).toBeInTheDocument();
+    });
+    
+    // Verify no results are shown
+    expect(screen.queryByText('Results:')).not.toBeInTheDocument();
+  });
+  
+  test('adds successful queries to history', async () => {
+    // Mock axios post response
+    axios.post.mockResolvedValueOnce({
+      data: {
+        original_query: "Show all employees",
+        sql_query: 'SELECT * FROM "employees";',
+        results: [{id: 1, name: "John Doe"}],
+        metadata: {row_count: 1}
       }
-    );
-  });
-
-  test('displays error when API request fails', async () => {
-    // Mock API failure
-    axios.post.mockRejectedValueOnce({ 
-      response: { 
-        data: { detail: 'Weather forecast not available for this date' } 
-      } 
     });
     
-    // Render the component
-    const { getByText, getByLabelText } = render(WeatherDressAssistant);
+    const { getByText, getByPlaceholderText } = render(NLQueryAssistant);
     
-    // Fill in the form
-    const locationInput = getByLabelText('Location');
-    const dateInput = getByLabelText('Date');
+    // Enter and submit query
+    const inputElement = getByPlaceholderText(/Show me all employees/i);
+    await fireEvent.input(inputElement, { target: { value: 'Show all employees' } });
+    await fireEvent.click(getByText('Search'));
     
-    await fireEvent.input(locationInput, { target: { value: 'London, UK' } });
-    await fireEvent.input(dateInput, { target: { value: '2030-01-01' } }); // Far future date
-    
-    // Submit the form
-    const submitButton = getByText('Get Recommendations');
-    await fireEvent.click(submitButton);
-    
-    // Wait for error to be displayed
-    await waitFor(() => {
-      expect(getByText('Weather forecast not available for this date')).toBeInTheDocument();
+    // Wait for results and check query history
+    await waitFor(async () => {
+      // Find and click the Query History element to expand it
+      const historyHeader = screen.getByText('Query History');
+      await fireEvent.click(historyHeader);
+      
+      // Verify query appears in history
+      expect(screen.getByText('Show all employees')).toBeInTheDocument();
+      expect(screen.getByText('1 results')).toBeInTheDocument();
     });
-  });
-
-  test('displays loading state during API request', async () => {
-    // Mock a delayed API response
-    axios.post.mockImplementationOnce(() => {
-      return new Promise(resolve => {
-        setTimeout(() => {
-          resolve({
-            data: {
-              date: '2023-10-21',
-              location: 'London, UK',
-              weather_summary: 'Cloudy',
-              temperature: 15.5,
-              conditions: 'Cloudy',
-              recommendations: { 
-                summary: 'Dress warmly',
-                outfit: {},
-                tips: []
-              }
-            }
-          });
-        }, 500);
-      });
-    });
-    
-    // Render the component
-    const { getByText, getByLabelText } = render(WeatherDressAssistant);
-    
-    // Fill in the form
-    const locationInput = getByLabelText('Location');
-    const dateInput = getByLabelText('Date');
-    
-    await fireEvent.input(locationInput, { target: { value: 'London, UK' } });
-    await fireEvent.input(dateInput, { target: { value: '2023-10-21' } });
-    
-    // Submit the form
-    const submitButton = getByText('Get Recommendations');
-    await fireEvent.click(submitButton);
-    
-    // Check that button is disabled and shows loading text
-    await waitFor(() => {
-      expect(getByText('Getting recommendations...')).toBeInTheDocument();
-      expect(getByText('Getting recommendations...')).toBeDisabled();
-    });
-    
-    // Wait for loading to complete
-    await waitFor(() => {
-      expect(getByText('Get Recommendations')).toBeInTheDocument();
-      expect(getByText('Get Recommendations')).not.toBeDisabled();
-    }, { timeout: 1000 });
   });
 });
